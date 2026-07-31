@@ -53,6 +53,19 @@ FORM_ACTION_TIMEOUT_MS = 15_000
 EMAIL_TAB_TIMEOUT_MS = 8_000
 WAF_READY_TIMEOUT_MS = 30_000
 SESSION_WAIT_TIMEOUT_MS = 45_000
+# 登录页渲染检测：WAF 滑块验证页会间歇性替换登录页内容，且此时 readyState 已是 complete，
+# 长时间等待无意义。用较短的单次超时换取更多重试次数，总耗时不变但命中未拦截窗口的概率更高。
+LOGIN_SHELL_TIMEOUT_MS = 25_000
+LOGIN_SHELL_MAX_ATTEMPTS = 6
+LOGIN_SHELL_RETRY_DELAY_SECONDS = 5
+
+# WAF 拦截页文本特征。阿里云滑块验证页会按 Accept-Language 返回中文或英文文案，
+# 缺少任一语种都会让检测把拦截页误判为“页面已渲染但缺少登录元素”，从而走错重试路径。
+_WAF_BLOCKED_TEXT_JS = (
+	r'/请进行验证|为了更好的访问体验|访问受限|滑动完成验证|请滑动验证'
+	r'|Access denied|verify you are human|Access Verification'
+	r'|slide to verify|slide to complete the verification/i'
+)
 
 _VISIBLE_CHECK_JS = """
 	const isVisible = (el) => {
@@ -70,7 +83,7 @@ _VISIBLE_CHECK_JS = """
 _SITE_READY_JS = f"""() => {{
 {_VISIBLE_CHECK_JS}
 	const text = document.body?.innerText || '';
-	const blocked = /请进行验证|为了更好的访问体验|访问受限|Access denied|verify you are human/i.test(text);
+	const blocked = {_WAF_BLOCKED_TEXT_JS}.test(text);
 	if (blocked) return false;
 	const wafBlockers = document.querySelector(
 		'iframe[src*="captcha"], iframe[src*="verify"], iframe[src*="slide"], .nc-container, #nocaptcha'
@@ -88,7 +101,7 @@ _SITE_READY_JS = f"""() => {{
 _LOGIN_SHELL_READY_JS = f"""() => {{
 {_VISIBLE_CHECK_JS}
 	const text = document.body?.innerText || '';
-	const blocked = /请进行验证|为了更好的访问体验|访问受限|Access denied|verify you are human/i.test(text);
+	const blocked = {_WAF_BLOCKED_TEXT_JS}.test(text);
 	if (blocked) return false;
 	return countVisible('.semi-card') > 0 || countVisible('#username') > 0 || countVisible('button') >= 2;
 }}"""
@@ -310,7 +323,7 @@ async def _settle_page(page: Page, delay_seconds: float, networkidle_timeout_ms:
 
 
 async def _wait_for_login_shell(page: Page, timeout_ms: int) -> bool:
-	shell_timeout = min(timeout_ms, 60_000)
+	shell_timeout = min(timeout_ms, LOGIN_SHELL_TIMEOUT_MS)
 	try:
 		await page.wait_for_function(_LOGIN_SHELL_READY_JS, timeout=shell_timeout)
 		return True
@@ -343,8 +356,8 @@ async def navigate_login_page(
 	except Exception as exc:
 		print(f'[WARN] Warmup navigation failed: {exc}')
 
-	for attempt in range(3):
-		print(f'[INFO] Navigating login page (attempt {attempt + 1}/3): {login_url}')
+	for attempt in range(LOGIN_SHELL_MAX_ATTEMPTS):
+		print(f'[INFO] Navigating login page (attempt {attempt + 1}/{LOGIN_SHELL_MAX_ATTEMPTS}): {login_url}')
 		await page.goto(login_url, wait_until='load', timeout=attempt_timeout)
 		await _settle_page(page, 5, 20_000)
 
@@ -353,12 +366,12 @@ async def navigate_login_page(
 			if await page.evaluate(_LOGIN_SHELL_READY_JS):
 				return
 
-		print(f'[WARN] Login page shell not ready on attempt {attempt + 1}')
+		print(f'[WARN] Login page shell not ready on attempt {attempt + 1}/{LOGIN_SHELL_MAX_ATTEMPTS}')
 		await _log_login_page_state(page)
 		if provider and account_name:
 			await save_login_screenshot(page, provider, account_name, f'login-shell-attempt-{attempt + 1}')
-		if attempt < 2:
-			await asyncio.sleep(5)
+		if attempt < LOGIN_SHELL_MAX_ATTEMPTS - 1:
+			await asyncio.sleep(LOGIN_SHELL_RETRY_DELAY_SECONDS)
 			try:
 				await page.reload(wait_until='load', timeout=attempt_timeout)
 			except Exception:  # nosec B110
@@ -606,7 +619,9 @@ async def _log_login_page_state(page: Page) -> None:
 			};
 		}"""
 	)
-	debug_print(f'[INFO] Login page state: {state}')
+	# 无条件输出：登录页渲染失败时这是唯一能区分 WAF 拦截、页面改版与网络问题的依据，
+	# 内容仅为页面文本与元素计数，不含凭据。
+	print(f'[INFO] Login page state: {state}')
 
 
 async def _open_email_login_form(

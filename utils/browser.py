@@ -385,6 +385,17 @@ async def has_session_cookie(page: Page) -> bool:
 	return any(c.get('name') == SESSION_COOKIE_NAME and c.get('value') for c in cookies)
 
 
+async def clear_session_cookie(page: Page) -> None:
+	"""Clear only the session cookie, preserving WAF/other cookies in the profile.
+
+	For providers whose check-in is triggered by a fresh login (sign_in_path is None),
+	a persisted profile would reuse a stale session and skip re-login, so the check-in
+	never fires. Clearing just the session cookie keeps WAF cookies (acw_tc etc.) intact
+	so the WAF does not re-challenge, while forcing a brand-new email login each run.
+	"""
+	await page.context.clear_cookies(name=SESSION_COOKIE_NAME)
+
+
 def _extract_user_profile(payload: object) -> dict | None:
 	if not isinstance(payload, dict):
 		return None

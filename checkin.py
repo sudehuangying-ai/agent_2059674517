@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 
 from utils.browser import (
 	BrowserLoginResult,
+	clear_session_cookie,
 	has_session_cookie,
 	is_logged_in,
 	launch_login_context,
@@ -185,6 +186,17 @@ async def login_with_credentials(
 			provider=provider_name,
 			account_name=account_name,
 		)
+
+		# Providers with sign_in_path=None (e.g. agentrouter) complete check-in as a
+		# side effect of a fresh login. A persisted profile keeps a stale session
+		# cookie, so is_logged_in() would short-circuit re-login and the check-in
+		# would never fire. Drop only the session cookie (WAF cookies like acw_tc are
+		# preserved) to force a brand-new email login every run.
+		if provider_config.sign_in_path is None:
+			if await has_session_cookie(page):
+				print(f'[INFO] {account_name}: Clearing stale session to force re-login for check-in')
+				await clear_session_cookie(page)
+				await page.reload(wait_until='load', timeout=timeout_ms)
 
 		if not await is_logged_in(page):
 			if await has_session_cookie(page):

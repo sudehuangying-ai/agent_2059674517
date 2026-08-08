@@ -385,15 +385,21 @@ async def has_session_cookie(page: Page) -> bool:
 	return any(c.get('name') == SESSION_COOKIE_NAME and c.get('value') for c in cookies)
 
 
-async def clear_session_cookie(page: Page) -> None:
-	"""Clear only the session cookie, preserving WAF/other cookies in the profile.
+async def force_logout(page: Page) -> None:
+	"""Clear login state from the persisted profile so a fresh login is performed.
 
-	For providers whose check-in is triggered by a fresh login (sign_in_path is None),
-	a persisted profile would reuse a stale session and skip re-login, so the check-in
-	never fires. Clearing just the session cookie keeps WAF cookies (acw_tc etc.) intact
-	so the WAF does not re-challenge, while forcing a brand-new email login each run.
+	Persisted profiles keep the session cookie AND localStorage tokens from the previous
+	run. For providers whose check-in is a side effect of re-login (sign_in_path is None),
+	reusing that state means is_logged_in() short-circuits re-login and the check-in
+	never fires (balance stays frozen across runs). The WAF cookies (acw_tc etc.) are
+	preserved so the WAF does not re-challenge; only the session cookie and localStorage
+	login tokens are cleared, which is enough to force a brand-new email login.
 	"""
 	await page.context.clear_cookies(name=SESSION_COOKIE_NAME)
+	try:
+		await page.evaluate('() => {{ localStorage.clear(); sessionStorage.clear(); }}')
+	except Exception:  # nosec B110
+		pass
 
 
 def _extract_user_profile(payload: object) -> dict | None:

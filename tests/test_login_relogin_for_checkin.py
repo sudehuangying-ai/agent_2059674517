@@ -1,9 +1,10 @@
 """login_with_credentials 对自动签到 provider 的退出重登回归测试。
 
 背景:agentrouter 这类 sign_in_path=None 的 provider,签到是重新登录的副作用。
-persist_profile=True 会复用持久化 profile 里的旧 session cookie,导致 is_logged_in()
-短路重新登录,签到永远不触发。修复方案:对这类 provider 在登录页加载后清除 session
-cookie(保留 WAF cookie),强制走邮箱重新登录。
+persist_profile=True 会复用持久化 profile 里的旧 session cookie 和 localStorage token,
+导致 is_logged_in() 短路重新登录,签到永远不触发(余额长期不变)。修复方案:对这类
+provider 在登录页加载后执行 force_logout(清 session cookie + localStorage,保留 WAF
+cookie),重新导航登录页并无条件走邮箱重新登录。
 """
 
 import pytest
@@ -36,10 +37,17 @@ class FakePage:
 	def __init__(self, context):
 		self.context = context
 		self.url = 'https://agentrouter.org/login'
-		self.reloaded = 0
+		self.localStorage_cleared = False
+		self.sessionStorage_cleared = False
+
+	async def evaluate(self, expression):
+		if 'localStorage.clear' in expression:
+			self.localStorage_cleared = True
+			self.sessionStorage_cleared = True
+		return None
 
 	async def reload(self, wait_until=None, timeout=None):
-		self.reloaded += 1
+		pass
 
 
 def _provider(*, sign_in_path, persist_profile=True):
@@ -87,12 +95,15 @@ def stub_browser_flow(monkeypatch, tmp_path):
 		calls.append('navigate_login_page')
 
 	async def fake_has_session_cookie(page):
-		# 反映 context 当前真实 cookie 状态
 		return any(c.get('name') == 'session' and c.get('value') for c in page.context._cookies)
 
-	async def fake_clear_session_cookie(page):
-		calls.append('clear_session_cookie')
+	async def fake_force_logout(page):
+		calls.append('force_logout')
 		await page.context.clear_cookies(name='session')
+		try:
+			await page.evaluate('() => { localStorage.clear(); sessionStorage.clear(); }')
+		except Exception:
+			pass
 
 	async def fake_is_logged_in(page):
 		calls.append('is_logged_in')
@@ -117,7 +128,7 @@ def stub_browser_flow(monkeypatch, tmp_path):
 	monkeypatch.setattr(checkin, 'prepare_browser_page', fake_prepare_browser_page)
 	monkeypatch.setattr(checkin, 'navigate_login_page', fake_navigate_login_page)
 	monkeypatch.setattr(checkin, 'has_session_cookie', fake_has_session_cookie)
-	monkeypatch.setattr(checkin, 'clear_session_cookie', fake_clear_session_cookie)
+	monkeypatch.setattr(checkin, 'force_logout', fake_force_logout)
 	monkeypatch.setattr(checkin, 'is_logged_in', fake_is_logged_in)
 	monkeypatch.setattr(checkin, 'save_login_screenshot', fake_save_login_screenshot)
 	monkeypatch.setattr(checkin, 'login_with_email_form', fake_login_with_email_form)
@@ -127,8 +138,8 @@ def stub_browser_flow(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_auto_checkin_provider_clears_stale_session(stub_browser_flow):
-	"""sign_in_path=None 的 provider 必须清除旧 session 并重新登录。"""
+async def test_auto_checkin_provider_forces_relogin_with_stale_session(stub_browser_flow):
+	"""sign_in_path=None 且有旧 session 时必须 force_logout 后重新登录。"""
 	calls = stub_browser_flow
 	provider = _provider(sign_in_path=None, persist_profile=True)
 
@@ -136,17 +147,16 @@ async def test_auto_checkin_provider_clears_stale_session(stub_browser_flow):
 
 	assert result is not None
 	assert result.api_user == '123'
-	# 清除发生在重新登录之前
-	assert 'clear_session_cookie' in calls
-	assert calls.index('clear_session_cookie') < calls.index('login_with_email_form')
+	# force_logout 发生在重新登录之前
+	assert 'force_logout' in calls
+	assert calls.index('force_logout') < calls.index('login_with_email_form')
 	assert 'login_with_email_form' in calls
 
 
 @pytest.mark.asyncio
-async def test_auto_checkin_provider_no_session_skips_clear(stub_browser_flow, monkeypatch):
-	"""没有旧 session cookie 时不调用 clear_session_cookie(避免多余 reload)。"""
+async def test_auto_checkin_provider_no_session_skips_force_logout(stub_browser_flow, monkeypatch):
+	"""没有旧 session cookie 时不调用 force_logout。"""
 
-	# 覆盖 fake_launch_login_context:初始只有 WAF cookie,无 session
 	async def fake_launch_no_session(settings, *, use_proxy=False):
 		return FakeContext([{'name': 'acw_tc', 'value': 'waf-value'}])
 
@@ -157,30 +167,53 @@ async def test_auto_checkin_provider_no_session_skips_clear(stub_browser_flow, m
 
 	await checkin.login_with_credentials('acct', provider, 'agentrouter', 'e@x.com', 'pw')
 
-	assert 'clear_session_cookie' not in calls
+	assert 'force_logout' not in calls
 	assert 'login_with_email_form' in calls
 
 
 @pytest.mark.asyncio
 async def test_manual_checkin_provider_preserves_session(stub_browser_flow):
-	"""sign_in_path 有值的 provider(如手动签到)不清除 session,保持原行为。"""
+	"""sign_in_path 有值的 provider(如手动签到)不执行 force_logout。"""
 	calls = stub_browser_flow
 	provider = _provider(sign_in_path='/api/user/sign_in', persist_profile=True)
 
 	await checkin.login_with_credentials('acct', provider, 'agentrouter', 'e@x.com', 'pw')
 
-	assert 'clear_session_cookie' not in calls
+	assert 'force_logout' not in calls
 
 
 @pytest.mark.asyncio
-async def test_clear_session_cookie_preserves_waf_cookies(stub_browser_flow):
-	"""清除 session 后,WAF cookie(acw_tc)仍保留在 context 中。"""
+async def test_force_logout_clears_local_and_session_storage():
+	"""force_logout 必须清除 session cookie + localStorage + sessionStorage。"""
+	from utils.browser import force_logout
+
+	ctx = FakeContext(
+		[
+			{'name': 'acw_tc', 'value': 'waf-value'},
+			{'name': 'session', 'value': 'stale-session-value'},
+		]
+	)
+	page = await ctx.new_page()
+
+	await force_logout(page)
+
+	# session cookie 被清,WAF cookie 保留
+	names = [c.get('name') for c in ctx._cookies]
+	assert 'session' not in names
+	assert 'acw_tc' in names
+	# localStorage / sessionStorage 被清
+	assert page.localStorage_cleared is True
+	assert page.sessionStorage_cleared is True
+
+
+@pytest.mark.asyncio
+async def test_force_logout_preserves_waf_cookies(stub_browser_flow):
+	"""force_logout 后,WAF cookie(acw_tc)仍保留在最终 cookies 中。"""
 	calls = stub_browser_flow
 	provider = _provider(sign_in_path=None, persist_profile=True)
 
 	result = await checkin.login_with_credentials('acct', provider, 'agentrouter', 'e@x.com', 'pw')
 
 	assert result is not None
-	# 结果 cookies 里应同时包含 WAF cookie 和登录后的新 session
 	assert result.cookies.get('acw_tc') == 'waf-value'
 	assert result.cookies.get('session') == 'fresh-session-value'

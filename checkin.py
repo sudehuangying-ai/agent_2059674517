@@ -21,7 +21,6 @@ from dotenv import load_dotenv
 
 from utils.browser import (
 	BrowserLoginResult,
-	force_logout,
 	has_session_cookie,
 	is_logged_in,
 	launch_login_context,
@@ -187,33 +186,7 @@ async def login_with_credentials(
 			account_name=account_name,
 		)
 
-		# Providers with sign_in_path=None (e.g. agentrouter) complete check-in as a
-		# side effect of a fresh login. A persisted profile keeps both the session
-		# cookie and localStorage tokens from the previous run, so is_logged_in()
-		# short-circuits re-login and the check-in never fires (balance stays frozen).
-		# Force a full logout — clear session cookie + localStorage while preserving
-		# WAF cookies (acw_tc) so the WAF does not re-challenge — then re-navigate to
-		# the login page and perform a brand-new email login unconditionally.
-		if provider_config.sign_in_path is None and await has_session_cookie(page):
-			print(f'[INFO] {account_name}: Forcing re-login to trigger check-in')
-			await force_logout(page)
-			await navigate_login_page(
-				page,
-				login_url,
-				timeout_ms,
-				provider=provider_name,
-				account_name=account_name,
-			)
-			await save_login_screenshot(page, provider_name, account_name, 'before-email-login')
-			await login_with_email_form(
-				page,
-				email,
-				password,
-				timeout_ms,
-				provider=provider_name,
-				account_name=account_name,
-			)
-		elif not await is_logged_in(page):
+		if not await is_logged_in(page):
 			if await has_session_cookie(page):
 				print(f'[WARN] {account_name}: Stale session cookie on login page, forcing email login')
 			await save_login_screenshot(page, provider_name, account_name, 'before-email-login')

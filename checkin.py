@@ -245,10 +245,12 @@ def get_user_info(client, headers, user_info_url: str):
 				user_data = data.get('data', {})
 				quota = round(user_data.get('quota', 0) / 500000, 2)
 				used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
+				group = user_data.get('group')
 				return {
 					'success': True,
 					'quota': quota,
 					'used_quota': used_quota,
+					'group': group,
 					'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
 				}
 		return {'success': False, 'error': f'Failed to get user info: HTTP {response.status_code}'}
@@ -318,7 +320,7 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict):
 def format_check_in_notification(detail: dict) -> str:
 	"""格式化签到通知消息"""
 	lines = [
-		f'[CHECK-IN] {detail["name"]}',
+		f'[CHECK-IN] {detail["name"]}（分组: {detail["group"]}）',
 		'  ━━━━━━━━━━━━━━━━━━━━',
 		'  签到前',
 		f'     余额: ${detail["before_quota"]:.2f}  |  累计消耗: ${detail["before_used"]:.2f}',
@@ -490,6 +492,9 @@ async def main():
 
 	app_config = AppConfig.load_from_env()
 	print(f'[INFO] Loaded {len(app_config.providers)} provider configuration(s)')
+	force_notify = os.getenv('CHECKIN_FORCE_NOTIFY', '').strip().lower() == 'true'
+	if force_notify:
+		print('[NOTIFY] Force notify enabled')
 	if is_debug_enabled():
 		for provider_name, provider in sorted(app_config.providers.items()):
 			print(f'[INFO] Provider "{provider_name}": use_proxy={provider.use_proxy}')
@@ -548,6 +553,7 @@ async def main():
 
 					account_check_in_details[account_key] = {
 						'name': account.get_display_name(i),
+						'group': user_info_after.get('group') or account.provider,
 						'before_quota': before_quota,
 						'before_used': before_used,
 						'after_quota': after_quota,
@@ -561,7 +567,10 @@ async def main():
 			if should_notify_this_account:
 				account_name = account.get_display_name(i)
 				status = '[SUCCESS]' if success else '[FAIL]'
-				account_result = f'{status} {account_name}'
+				group_label = account.provider
+				if user_info_after:
+					group_label = user_info_after.get('group') or account.provider
+				account_result = f'{status} {account_name}（分组: {group_label}）'
 				if user_info_after and user_info_after.get('success'):
 					account_result += f'\n{user_info_after["display"]}'
 				elif user_info_after:
@@ -572,7 +581,8 @@ async def main():
 			account_name = account.get_display_name(i)
 			print(f'[FAILED] {account_name} processing exception: {e}')
 			need_notify = True
-			notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
+			group_label = account.provider
+			notification_content.append(f'[FAIL] {account_name}（分组: {group_label}）exception: {str(e)[:50]}...')
 
 	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
 	if current_balance_hash:
@@ -587,7 +597,10 @@ async def main():
 		else:
 			print('[INFO] No balance changes detected')
 
-	if balance_changed:
+	if force_notify:
+		need_notify = True
+
+	if balance_changed or force_notify:
 		for i, account in enumerate(accounts):
 			account_key = f'account_{i + 1}'
 			if account_key in account_check_in_details:

@@ -40,7 +40,8 @@ jobs:
       PYTHONIOENCODING: utf-8
       PYTHONUNBUFFERED: 1
       PYTHONDONTWRITEBYTECODE: '1'
-      TMPDIR: ${{ github.workspace }}/.cache/warp/tmp
+      # Keep Chromium Unix socket paths below Linux's 108-byte limit in this long repository path.
+      TMPDIR: ${{ github.workspace }}/.t
       GNUPGHOME: ${{ github.workspace }}/.cache/warp/gnupg
       UV_CACHE_DIR: ${{ github.workspace }}/.cache/uv
       CLOAKBROWSER_CACHE_DIR: ${{ github.workspace }}/.cache/cloakbrowser

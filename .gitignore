@@ -5,6 +5,7 @@ __pycache__
 .pytest_cache
 .ruff_cache
 .cache
+.t
 .mypy_cache
 .coverage
 coverage.xml
